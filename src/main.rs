@@ -1,7 +1,7 @@
 #![cfg(target_os = "windows")]
-use std::ffi::OsStr;
+
 use std::mem::{zeroed, size_of};
-use std::os::windows::ffi::OsStrExt;
+use std::ptr::{null_mut, copy_nonoverlapping};
 use windows_sys::Win32::Foundation::{CloseHandle, GetLastError, HANDLE};
 use windows_sys::Win32::Storage::FileSystem::{
     DELETE, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, SetFileInformationByHandle,
@@ -9,9 +9,8 @@ use windows_sys::Win32::Storage::FileSystem::{
 };
 use windows_sys::Win32::System::LibraryLoader::GetModuleFileNameW;
 use windows_sys::Win32::Storage::FileSystem::CreateFileW;
-use std::ptr::{null_mut, copy_nonoverlapping};
 
-const MAX: usize = 500usize;
+const MAX_PATH_LENGTH: usize = 500;
 const FILE_DISPOSITION_FLAG_DELETE: u32 = 0x00000001;
 const FILE_DISPOSITION_FLAG_POSIX_SEMANTICS: u32 = 0x00000002;
 
@@ -20,171 +19,214 @@ struct FileDispositionInfoEx {
     flags: u32,
 }
 
-pub unsafe fn handle_file_operation() {
-    let mut buffer: [u16; MAX + 1] = [0; MAX + 1];
-
-    unsafe {
-        if !get_module_file_name(&mut buffer) {
-            println!("[-] Unable to retrieve module file name.");
-            return;
-        }
-    }
-
-    let current_handle = unsafe { create_file(buffer.as_ptr()) };
-
-    if current_handle.is_null() {
-        let error_code = unsafe { GetLastError() };
-        println!("[-] Failed to open current file handle. Error code: {}", error_code);
-        return;
-    }
-
-    unsafe {
-        if !set_file_rename_info(current_handle, &OsStr::new(":12").encode_wide().collect::<Vec<_>>()) {
-            let error_code = GetLastError();
-            CloseHandle(current_handle);
-            println!("[-] Failed to set file rename info. Error code: {}", error_code);
-            return;
-        }
-    }
-
-    unsafe {
-        CloseHandle(current_handle);
-    }
-
-    let mut buffer2: [u16; MAX + 1] = [0; MAX + 1];
-
-    unsafe {
-        if !get_module_file_name(&mut buffer2) {
-            println!("[-] Unable to retrieve module file name after rename.");
-            return;
-        }
-    }
-
-    let new_handle = unsafe { create_file(buffer2.as_ptr()) };
-
-    if new_handle.is_null() {
-        let error_code = unsafe { GetLastError() };
-        println!("[-] Failed to open new file handle. Error code: {}", error_code);
-        return;
-    }
-
-    unsafe {
-        if !set_file_disposition_info_ex(new_handle) {
-            let error_code = GetLastError();
-            CloseHandle(new_handle);
-            println!("[-] Failed to set file disposition info. Error code: {}", error_code);
-            return;
-        }
-    }
-
-    unsafe {
-        CloseHandle(new_handle);
-    }
-
-    println!("[+] File operation completed successfully.");
+#[derive(Debug)]
+pub enum SelfDeleteError {
+    ModulePathNotFound,
+    FileHandleFailed(u32),
+    RenameFailed(u32),
+    DispositionFailed(u32),
 }
 
-unsafe fn get_module_file_name(buffer: &mut [u16; MAX + 1]) -> bool {
-    unsafe {
-        let current_path = GetModuleFileNameW(null_mut(), buffer.as_mut_ptr(), 261u32);
-        current_path != 0
+impl std::fmt::Display for SelfDeleteError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SelfDeleteError::ModulePathNotFound => write!(f, "Could not retrieve module file path"),
+            SelfDeleteError::FileHandleFailed(code) => write!(f, "Failed to open file handle (error: {})", code),
+            SelfDeleteError::RenameFailed(code) => write!(f, "Failed to rename file (error: {})", code),
+            SelfDeleteError::DispositionFailed(code) => write!(f, "Failed to set file disposition (error: {})", code),
+        }
     }
 }
 
-unsafe fn create_file(file_name: *const u16) -> HANDLE {
-    unsafe {
-        let handle = CreateFileW(
-            file_name,
-            DELETE,
-            0,
-            null_mut(),
-            OPEN_EXISTING,
-            FILE_ATTRIBUTE_NORMAL,
-            null_mut()
-        );
+impl std::error::Error for SelfDeleteError {}
+
+/// Safe wrapper for Windows file handle
+struct FileHandle(HANDLE);
+
+impl FileHandle {
+    /// Opens a file with DELETE access rights
+    fn open_for_deletion(path: &[u16]) -> Result<Self, SelfDeleteError> {
+        let handle = unsafe {
+            CreateFileW(
+                path.as_ptr(),
+                DELETE,
+                0,
+                null_mut(),
+                OPEN_EXISTING,
+                FILE_ATTRIBUTE_NORMAL,
+                null_mut(),
+            )
+        };
 
         if handle.is_null() {
-            let error_code = GetLastError();
-            println!("[-] Failed to create file handle. Error code: {}", error_code);
+            let error_code = unsafe { GetLastError() };
+            Err(SelfDeleteError::FileHandleFailed(error_code))
+        } else {
+            Ok(FileHandle(handle))
         }
-        handle
+    }
+
+    /// Renames the file to an alternate data stream - using EXACT same approach as working code
+    fn rename_to_stream(&self) -> Result<(), SelfDeleteError> {
+        // Use the exact same stream name and encoding as the working code
+        let stream_name = ":12";
+        let stream_wide: Vec<u16> = stream_name.encode_utf16().collect(); // No null terminator
+
+        unsafe {
+            let mut rename_info: FILE_RENAME_INFO = zeroed();
+            // Use the exact same calculation as working code
+            rename_info.FileNameLength = (stream_wide.len() * size_of::<u16>()) as u32;
+
+            copy_nonoverlapping(
+                stream_wide.as_ptr(),
+                rename_info.FileName.as_mut_ptr(),
+                stream_wide.len(),
+            );
+
+            let result = SetFileInformationByHandle(
+                self.0,
+                3, // FileRenameInfo
+                &rename_info as *const _ as *mut _,
+                size_of::<FILE_RENAME_INFO>() as u32,
+            );
+
+            if result == 0 {
+                let error_code = GetLastError();
+                Err(SelfDeleteError::RenameFailed(error_code))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    /// Marks the file for deletion using the appropriate method for the Windows version
+    fn mark_for_deletion(&self) -> Result<(), SelfDeleteError> {
+        // Try the new Windows 24H2 method first
+        match self.mark_for_deletion_ex() {
+            Ok(()) => {
+                println!("[+] Used FILE_DISPOSITION_INFO_EX method (Windows 24H2+)");
+                Ok(())
+            }
+            Err(_) => {
+                println!("[-] FILE_DISPOSITION_INFO_EX failed, falling back to traditional method");
+                self.mark_for_deletion_old()
+            }
+        }
+    }
+
+    fn mark_for_deletion_ex(&self) -> Result<(), SelfDeleteError> {
+        unsafe {
+            let disposition_info = FileDispositionInfoEx {
+                flags: FILE_DISPOSITION_FLAG_DELETE | FILE_DISPOSITION_FLAG_POSIX_SEMANTICS,
+            };
+
+            let result = SetFileInformationByHandle(
+                self.0,
+                21, // FileDispositionInfoEx
+                &disposition_info as *const _ as *mut _,
+                size_of::<FileDispositionInfoEx>() as u32,
+            );
+
+            if result == 0 {
+                let error_code = GetLastError();
+                Err(SelfDeleteError::DispositionFailed(error_code))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    fn mark_for_deletion_old(&self) -> Result<(), SelfDeleteError> {
+        unsafe {
+            let mut disposition_info: FILE_DISPOSITION_INFO = zeroed();
+            disposition_info.DeleteFile = true;
+
+            let result = SetFileInformationByHandle(
+                self.0,
+                4, // FileDispositionInfo
+                &disposition_info as *const _ as *mut _,
+                size_of::<FILE_DISPOSITION_INFO>() as u32,
+            );
+
+            if result == 0 {
+                let error_code = GetLastError();
+                Err(SelfDeleteError::DispositionFailed(error_code))
+            } else {
+                Ok(())
+            }
+        }
     }
 }
 
-unsafe fn set_file_rename_info(handle: HANDLE, file_name: &[u16]) -> bool {
-    unsafe {
-        let mut f_rename: FILE_RENAME_INFO = zeroed();
-        f_rename.FileNameLength = (file_name.len() * size_of::<u16>()) as u32;
-        copy_nonoverlapping(file_name.as_ptr(), f_rename.FileName.as_mut_ptr(), file_name.len());
-
-        let rename_result = SetFileInformationByHandle(
-            handle,
-            3, // FileRenameInfo
-            &f_rename as *const FILE_RENAME_INFO as *mut _,
-            size_of::<FILE_RENAME_INFO>() as u32,
-        );
-
-        if rename_result == 0 {
-            let error_code = GetLastError();
-            println!("[-] Failed to set file rename info. Error code: {}", error_code);
-        } else {
-            println!("[+] File rename info set successfully");
+impl Drop for FileHandle {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe {
+                CloseHandle(self.0);
+            }
         }
-        rename_result != 0
     }
 }
 
-unsafe fn set_file_disposition_info_ex(handle: HANDLE) -> bool {
-    unsafe {
-        let mut temp: FileDispositionInfoEx = zeroed();
-        temp.flags = FILE_DISPOSITION_FLAG_DELETE | FILE_DISPOSITION_FLAG_POSIX_SEMANTICS;
+/// Gets the current executable path as a wide character string
+fn get_current_executable_path() -> Result<[u16; MAX_PATH_LENGTH + 1], SelfDeleteError> {
+    let mut buffer = [0u16; MAX_PATH_LENGTH + 1];
 
-        let disp_result = SetFileInformationByHandle(
-            handle,
-            21, // FileDispositionInfoEx - Windows 24H2
-            &temp as *const FileDispositionInfoEx as *mut _,
-            size_of::<FileDispositionInfoEx>() as u32,
-        );
+    let path_length = unsafe {
+        GetModuleFileNameW(null_mut(), buffer.as_mut_ptr(), MAX_PATH_LENGTH as u32)
+    };
 
-        if disp_result == 0 {
-            let error_code = GetLastError();
-            println!("[-] Failed to set file disposition info (EX). Error code: {}", error_code);
-
-            // Fallback to old method if EX fails
-            println!("[-] Trying fallback to old FILE_DISPOSITION_INFO...");
-            return set_file_disposition_info_old(handle);
-        } else {
-            println!("[+] File disposition info (EX) set successfully");
-        }
-        disp_result != 0
+    if path_length == 0 {
+        Err(SelfDeleteError::ModulePathNotFound)
+    } else {
+        Ok(buffer)
     }
 }
 
-// Keep the old method as fallback
-unsafe fn set_file_disposition_info_old(handle: HANDLE) -> bool {
-    unsafe {
-        let mut temp: FILE_DISPOSITION_INFO = zeroed();
-        temp.DeleteFile = true; // Fixed: changed from 1 to true
+/// Performs the self-deletion operation
+pub fn self_delete() -> Result<(), SelfDeleteError> {
+    println!("[+] Starting self-deletion process...");
 
-        let disp_result = SetFileInformationByHandle(
-            handle,
-            4, // FileDispositionInfo
-            &temp as *const FILE_DISPOSITION_INFO as *mut _,
-            size_of::<FILE_DISPOSITION_INFO>() as u32,
-        );
+    let original_path = get_current_executable_path()?;
+    println!("[+] Current executable path retrieved");
 
-        if disp_result == 0 {
-            let error_code = GetLastError();
-            println!("[-] Failed to set file disposition info (old). Error code: {}", error_code);
-        } else {
-            println!("[+] File disposition info (old) set successfully");
-        }
-        disp_result != 0
+    // Step 1: Rename the file to break the lock
+    println!("[+] Step 1: Renaming file to alternate data stream...");
+    {
+        let file_handle = FileHandle::open_for_deletion(&original_path)?;
+        file_handle.rename_to_stream()?; // Use the exact same approach
+        println!("[+] File renamed successfully");
+        // FileHandle is automatically closed here due to Drop trait
     }
+
+    // Small delay to ensure rename is processed
+    std::thread::sleep(std::time::Duration::from_millis(100));
+
+    // Step 2: Reopen and mark for deletion
+    println!("[+] Step 2: Marking file for deletion...");
+    let new_path = get_current_executable_path()?;
+    let file_handle = FileHandle::open_for_deletion(&new_path)?;
+    file_handle.mark_for_deletion()?;
+    println!("[+] File marked for deletion successfully");
+
+    // FileHandle automatically closed here
+    Ok(())
 }
 
 fn main() {
-    unsafe {
-        handle_file_operation();
+    match self_delete() {
+        Ok(()) => {
+            println!("[+] Self-deletion completed successfully!");
+            println!("[+] File will be deleted when this process exits");
+            // Keep process alive for a bit to demonstrate it still runs
+            println!("[+] Process continues running for 5 seconds...");
+            std::thread::sleep(std::time::Duration::from_secs(5));
+            println!("[+] Process exiting, file should now be deleted");
+        }
+        Err(e) => {
+            println!("[-] Self-deletion failed: {}", e);
+            println!("[-] This might be due to Windows version restrictions or permissions");
+            std::process::exit(1);
+        }
     }
 }
