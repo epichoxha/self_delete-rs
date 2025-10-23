@@ -7,7 +7,7 @@ A Rust implementation that allows a running Windows executable to delete itself 
 ## Compatibility
 
 - **Windows 10, Windows 11 (pre-24H2)**: Uses traditional `FILE_DISPOSITION_INFO` method
-- **Windows 11 24H2 and later**: Uses new `FILE_DISPOSITION_INFO_EX` method with `FILE_DISPOSITION_FLAG_POSIX_SEMANTICS` to comply with enhanced security restrictions
+- **Windows 11 24H2 and later**: Uses new `FILE_DISPOSITION_INFO_EX` method with `FILE_DISPOSITION_FLAG_POSIX_SEMANTICS` to comply with enhanced security restrictions (tested on 25H2)
 - **Cross-compilation**: Supports building from macOS/Linux to Windows targets
 
 ## Technical Overview
