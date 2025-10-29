@@ -36,3 +36,7 @@ The implementation includes automatic detection and fallback:
 - Falls back to traditional method if the new API is unavailable
 - Handles both scenarios gracefully without user intervention
 
+
+## Reference/Props
+- https://github.com/LloydLabs/delete-self-poc
+- https://github.com/tftftftft/rust-self-delete
